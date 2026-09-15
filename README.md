@@ -1,5 +1,8 @@
 
-![Screenshot](site/assets/static/logo.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="site/assets/static/logo-dark.svg">
+  <img alt="pkg.bot" src="site/assets/static/logo.svg" width="275">
+</picture>
 
 # pkg.bot
 
