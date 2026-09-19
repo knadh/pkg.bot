@@ -4,9 +4,10 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Response,
+    Json,
 };
 use axum_extra::extract::Query;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{paginate, respond, ApiErr, ApiFormat, Ctx, Result};
 use crate::{
@@ -17,11 +18,42 @@ use crate::{
 /// Maximum suggestions returned per query.
 const LIMIT: usize = 15;
 
+/// Health check response.
+#[derive(Debug, Serialize)]
+pub struct HealthStatus {
+    pub status: &'static str,
+    pub database: &'static str,
+    pub repos_loaded: usize,
+}
+
 /// `?q=` on a suggest endpoint.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct SuggestQuery {
     pub q: String,
+}
+
+/// Health check endpoint for container orchestration.
+pub async fn health_check(State(ctx): State<Arc<Ctx>>) -> Result<(StatusCode, Json<HealthStatus>)> {
+    // Quick DB connectivity check
+    match ctx.mgr.health_check().await {
+        Ok(()) => Ok((
+            StatusCode::OK,
+            Json(HealthStatus {
+                status: "healthy",
+                database: "connected",
+                repos_loaded: ctx.repos.len(),
+            }),
+        )),
+        Err(_) => Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthStatus {
+                status: "unhealthy",
+                database: "disconnected",
+                repos_loaded: ctx.repos.len(),
+            }),
+        )),
+    }
 }
 
 /// Get the list of all repositories.
