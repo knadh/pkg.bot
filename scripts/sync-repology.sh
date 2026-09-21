@@ -13,15 +13,18 @@ dir=$(realpath "${1:?usage: $0 DATA_DIR [FORCE_IMPORT]}")
 force_import=${2:-0}
 dump="$dir/repology-database-dump-latest.sql.zst"
 pending="$dump.pending"
-tmp=/tmp/data.db
+sync_dir="$dir/.sync"
+tmp="$sync_dir/data.db"
 stopped=false
 backed_up=false
 
 [[ -f "$dir/data.db" ]] || { log "missing $dir/data.db" >&2; exit 1; }
-[[ "$dir" != /tmp ]] || { log "DATA_DIR must not be /tmp" >&2; exit 1; }
+mkdir -p "$sync_dir"
+export TMPDIR="$sync_dir"
+export SQLITE_TMPDIR="$sync_dir"
 
-# Global lock check.
-exec 9>/tmp/pkgbot-sync-repology.lock
+# Lock syncs for this data directory.
+exec 9>"$sync_dir/sync-repology.lock"
 flock -n 9 || { log "repology sync is already running; skipping"; exit 0; }
 
 cleanup() {
@@ -36,7 +39,7 @@ cleanup() {
             mv -f "$dir/data.db.bak" "$dir/data.db" || true
         fi
         log "restarting pkgbot during cleanup"
-        sudo -n systemctl start pkgbot || true
+        systemctl start pkgbot || true
     fi
     rm -f "$dump.part" "$dir/data.db.new"
     exit "$status"
@@ -89,9 +92,9 @@ log "repology dump restore complete"
 # Run the import.
 log "removing temporary SQLite database files and initializing a new database"
 rm -f "$tmp" "$tmp-wal" "$tmp-shm"
-./pkgbot --db=/tmp/data.db install --yes
+./pkgbot --db="$tmp" install --yes
 log "starting package import into SQLite"
-./pkgbot --db=/tmp/data.db import
+./pkgbot --db="$tmp" import
 log "package import complete"
 
 # Stop docker once the import is done.
@@ -102,12 +105,12 @@ docker compose down db
 log "staging the new database and matching permissions and ownership"
 mv -f "$tmp" "$dir/data.db.new"
 chmod --reference="$dir/data.db" "$dir/data.db.new"
-sudo -n chown --reference="$dir/data.db" "$dir/data.db.new"
+chown --reference="$dir/data.db" "$dir/data.db.new"
 
 # Create a backup, stop the app, and replace the old DB with the new one.
 log "stopping pkgbot"
 stopped=true
-sudo -n systemctl stop pkgbot
+systemctl stop pkgbot
 log "backing up the current database and replacing it with the new database"
 mv -f "$dir/data.db" "$dir/data.db.bak"
 backed_up=true
@@ -115,7 +118,7 @@ mv -f "$dir/data.db.new" "$dir/data.db"
 
 # Start!
 log "starting pkgbot"
-sudo -n systemctl start pkgbot
+systemctl start pkgbot
 stopped=false
 rm -f "$pending"
 log "repology sync complete"
