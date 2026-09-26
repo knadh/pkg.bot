@@ -4,9 +4,10 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Response,
+    Json,
 };
 use axum_extra::extract::Query;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{paginate, respond, ApiErr, ApiFormat, Ctx, Result};
 use crate::{
@@ -22,6 +23,27 @@ const LIMIT: usize = 15;
 #[serde(default)]
 pub struct SuggestQuery {
     pub q: String,
+}
+
+/// Health check response.
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub num_repos: usize,
+}
+
+/// Health check endpoint for container orchestration.
+pub async fn health_check(State(ctx): State<Arc<Ctx>>) -> Result<Json<HealthResponse>> {
+    // Check database connectivity
+    ctx.mgr.health_check().await?;
+
+    let num_repos = ctx.repos.len();
+
+    // If no repos loaded, return 503
+    if num_repos == 0 {
+        return Err(ApiErr::new("no repositories loaded", StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    Ok(Json(HealthResponse { num_repos }))
 }
 
 /// Get the list of all repositories.
@@ -207,4 +229,82 @@ pub async fn search_packages(
 
     let results = list_packages(ctx, &repo, q).await?;
     Ok((repo, results))
+}
+
+#[cfg(test)]
+mod health_check_tests {
+    use super::*;
+    use crate::{
+        manager::Manager,
+        models::{JsonString, Repo, SCHEMA, Suggestions},
+        Consts,
+    };
+
+    /// Build an app context backed by an in-memory SQLite database with the
+    /// full schema installed, so the manager can run real queries against it.
+    async fn make_ctx(repos: Vec<Repo>) -> Arc<Ctx> {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory db");
+        sqlx::query(&SCHEMA.schema.query).execute(&db).await.unwrap();
+        let mgr = Arc::new(Manager::new(db));
+
+        Arc::new(Ctx {
+            mgr,
+            repos,
+            last_updated: None,
+            licenses: Suggestions::new(vec![]),
+            platforms: Suggestions::new(vec![]),
+            site: None,
+            consts: Consts {
+                root_url: "/".to_string(),
+                api_default_per_page: 20,
+                api_max_per_page: 100,
+                site_default_per_page: 20,
+                site_max_per_page: 100,
+            },
+            asset_ver: "test".to_string(),
+        })
+    }
+
+    fn repo(slug: &str) -> Repo {
+        Repo {
+            id: 1,
+            slug: slug.to_string(),
+            name: slug.to_string(),
+            family: "test".to_string(),
+            manager: "apt".to_string(),
+            distro: None,
+            branch: None,
+            homepage_url: None,
+            links: JsonString(serde_json::json!([]).to_string()),
+            pkg_url_template: None,
+            source_url_template: None,
+            meta: JsonString(serde_json::json!({}).to_string()),
+            brand_color: None,
+            score: 0.0,
+            package_count: 0,
+            num_packages: 0,
+            num_maintainers: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_503_when_no_repos() {
+        let ctx = make_ctx(vec![]).await;
+        let err = health_check(State(ctx))
+            .await
+            .expect_err("expected an error");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_200_with_num_repos() {
+        let ctx = make_ctx(vec![repo("arch"), repo("debian")]).await;
+        let Json(HealthResponse { num_repos }) =
+            health_check(State(ctx)).await.expect("expected success");
+        assert_eq!(num_repos, 2);
+    }
 }

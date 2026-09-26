@@ -15,6 +15,7 @@ use crate::handlers::{api, site, Ctx, ReqStarted};
 pub fn init_handlers(ctx: Arc<Ctx>) -> Router {
     // JSON  and pipe-separated CSV APIs.
     let mut router = Router::new()
+        .route("/api/health", get(api::health_check))
         .route("/api/repos", get(api::get_repos))
         .route("/api/repos/{repo}", get(api::get_repo))
         .route("/api/repos/{repo}/packages", get(api::query_packages))
