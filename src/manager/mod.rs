@@ -22,6 +22,12 @@ impl Manager {
         Self { db }
     }
 
+    /// Check whether the database is reachable.
+    pub async fn health_check(&self) -> Result<(), Error> {
+        sqlx::query("SELECT 1").execute(&self.db).await?;
+        Ok(())
+    }
+
     /// Get a repo by its ID or slug.
     pub async fn get_repo(&self, id: Option<i64>, slug: Option<&str>) -> Result<Repo, Error> {
         sqlx::query_as(&Q.get_repo.query)

@@ -4,9 +4,10 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Response,
+    Json,
 };
 use axum_extra::extract::Query;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{paginate, respond, ApiErr, ApiFormat, Ctx, Result};
 use crate::{
@@ -22,6 +23,27 @@ const LIMIT: usize = 15;
 #[serde(default)]
 pub struct SuggestQuery {
     pub q: String,
+}
+
+/// Health check response.
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub num_repos: usize,
+}
+
+/// Health check endpoint for container orchestration.
+pub async fn health_check(State(ctx): State<Arc<Ctx>>) -> Result<Json<HealthResponse>> {
+    // Check database connectivity
+    ctx.mgr.health_check().await?;
+
+    let num_repos = ctx.repos.len();
+
+    // If no repos loaded, return 503
+    if num_repos == 0 {
+        return Err(ApiErr::new("no repositories loaded", StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    Ok(Json(HealthResponse { num_repos }))
 }
 
 /// Get the list of all repositories.
@@ -208,3 +230,4 @@ pub async fn search_packages(
     let results = list_packages(ctx, &repo, q).await?;
     Ok((repo, results))
 }
+
