@@ -1,160 +1,227 @@
-use sqlx::sqlite::SqlitePool;
+mod query;
+
+use std::time::Duration;
+
+use sqlx::sqlite::{SqliteConnection, SqlitePool};
+
+use query::QueryConnection;
 
 use crate::models::{
-    comparisons, get_comparator, normalize_version, Cursor, Listing, Package, PackageQuery, Repo,
-    RepoQuery, Sort, BY_FACET, BY_NAME, Q, SEARCH_PACKAGES,
+    comparisons, get_comparator, normalize_version, Cursor, DbConfig, Listing, Package,
+    PackageQuery, Repo, RepoQuery, Sort, BY_FACET, BY_NAME, Q, SEARCH_PACKAGES,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("database error: {0}")]
-    Db(#[from] sqlx::Error),
+    Db(sqlx::Error),
     #[error("not found")]
     NotFound,
+    #[error("server is busy; try after a while")]
+    Busy,
+    #[error("query timed out")]
+    Timeout,
+}
+
+impl From<sqlx::Error> for Error {
+    fn from(err: sqlx::Error) -> Self {
+        match &err {
+            sqlx::Error::PoolTimedOut => Self::Busy,
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("9") => {
+                log::warn!("SQLite query interrupted after reaching its deadline");
+                Self::Timeout
+            }
+            _ => Self::Db(err),
+        }
+    }
 }
 
 pub struct Manager {
     db: SqlitePool,
+    health_db: SqlitePool,
+    query_timeout: Duration,
 }
 
 impl Manager {
-    pub fn new(db: SqlitePool) -> Self {
-        Self { db }
+    pub fn new(db: SqlitePool, health_db: SqlitePool, config: &DbConfig) -> Self {
+        Self {
+            db,
+            health_db,
+            query_timeout: Duration::from_millis(config.query_timeout_ms),
+        }
+    }
+
+    /// All statements in a query share one combined execution deadline and one conn.
+    async fn query<T>(
+        &self,
+        run: impl AsyncFnOnce(&mut SqliteConnection) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut conn = QueryConnection::acquire(&self.db, self.query_timeout).await?;
+        tokio::time::timeout_at(conn.deadline(), run(conn.connection()))
+            .await
+            .map_err(|_| Error::Timeout)?
     }
 
     /// Check whether the database is reachable.
     pub async fn health_check(&self) -> Result<(), Error> {
-        sqlx::query("SELECT 1").execute(&self.db).await?;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            sqlx::query("SELECT 1").execute(&self.health_db),
+        )
+        .await
+        .map_err(|_| Error::Busy)??;
         Ok(())
     }
 
     /// Get a repo by its ID or slug.
     pub async fn get_repo(&self, id: Option<i64>, slug: Option<&str>) -> Result<Repo, Error> {
-        sqlx::query_as(&Q.get_repo.query)
-            .bind(id)
-            .bind(slug)
-            .fetch_optional(&self.db)
-            .await?
-            .ok_or(Error::NotFound)
+        self.query(async |conn| {
+            sqlx::query_as(&Q.get_repo.query)
+                .bind(id)
+                .bind(slug)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or(Error::NotFound)
+        })
+        .await
     }
 
     pub async fn get_repos(&self, sort: &Sort, filter: &RepoQuery) -> Result<Vec<Repo>, Error> {
-        // Optional sort.
-        let sql = Q
-            .get_repos
-            .query
-            .replace("{ORDER_BY}", &sort.order_by)
-            .replace("{ORDER}", &sort.order);
+        self.query(async |conn| {
+            // Optional sort.
+            let sql = Q
+                .get_repos
+                .query
+                .replace("{ORDER_BY}", &sort.order_by)
+                .replace("{ORDER}", &sort.order);
 
-        Ok(sqlx::query_as(&sql)
-            .bind(filter.family.trim())
-            .bind(filter.distro.trim())
-            .bind(filter.manager.trim())
-            .fetch_all(&self.db)
-            .await?)
+            Ok(sqlx::query_as(&sql)
+                .bind(filter.family.trim())
+                .bind(filter.distro.trim())
+                .bind(filter.manager.trim())
+                .fetch_all(&mut *conn)
+                .await?)
+        })
+        .await
     }
 
     /// Get the default grouped repo list (sorted desc by package count).
     pub async fn get_repos_grouped(&self, filter: &RepoQuery) -> Result<Vec<Repo>, Error> {
-        Ok(sqlx::query_as(&Q.get_repos_grouped.query)
-            .bind(filter.family.trim())
-            .bind(filter.distro.trim())
-            .bind(filter.manager.trim())
-            .fetch_all(&self.db)
-            .await?)
+        self.query(async |conn| {
+            Ok(sqlx::query_as(&Q.get_repos_grouped.query)
+                .bind(filter.family.trim())
+                .bind(filter.distro.trim())
+                .bind(filter.manager.trim())
+                .fetch_all(&mut *conn)
+                .await?)
+        })
+        .await
     }
 
     pub async fn get_package(&self, repo_id: i64, slug: &str) -> Result<Package, Error> {
-        sqlx::query_as(&Q.get_package.query)
-            .bind(repo_id)
-            .bind(slug)
-            .fetch_optional(&self.db)
-            .await?
-            .ok_or(Error::NotFound)
+        self.query(async |conn| {
+            sqlx::query_as(&Q.get_package.query)
+                .bind(repo_id)
+                .bind(slug)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or(Error::NotFound)
+        })
+        .await
     }
 
     /// Get alphabetical listing of a repo's packages.
     pub async fn get_packages(&self, pq: &PackageQuery) -> Result<(Vec<Package>, bool), Error> {
-        let back = !pq.before.is_empty();
-        let cur = Cursor::parse(if back { &pq.before } else { &pq.after });
+        self.query(async |conn| {
+            let back = !pq.before.is_empty();
+            let cur = Cursor::parse(if back { &pq.before } else { &pq.after });
 
-        let Some(plan) = self.plan(pq).await? else {
-            return Ok((vec![], false));
-        };
+            let Some(plan) = self.plan(pq, &mut *conn).await? else {
+                return Ok((vec![], false));
+            };
 
-        // Fetch one extra row to detect whether there is another page after this.
-        let sql = if back { &plan.lst.prev } else { &plan.lst.next };
-        let sql = comparisons(sql, pq, 9);
-        let mut packages: Vec<Package> = sqlx::query_as(&sql)
-            .bind(pq.repo_id)
-            .bind(&plan.kind)
-            .bind(&plan.value)
-            .bind(&plan.residual)
-            .bind(pq.platform.trim())
-            .bind(&cur.name)
-            .bind(cur.id)
-            .bind(pq.limit + 1)
-            .bind(normalize_version(get_comparator(&pq.version).1))
-            .bind((!pq.updated_at.is_empty()).then(|| get_comparator(&pq.updated_at).1))
-            .fetch_all(&self.db)
-            .await?;
+            // Fetch one extra row to detect whether there is another page after this.
+            let sql = if back { &plan.lst.prev } else { &plan.lst.next };
+            let sql = comparisons(sql, pq, 9);
+            let mut packages: Vec<Package> = sqlx::query_as(&sql)
+                .bind(pq.repo_id)
+                .bind(&plan.kind)
+                .bind(&plan.value)
+                .bind(&plan.residual)
+                .bind(pq.platform.trim())
+                .bind(&cur.name)
+                .bind(cur.id)
+                .bind(pq.limit + 1)
+                .bind(normalize_version(get_comparator(&pq.version).1))
+                .bind((!pq.updated_at.is_empty()).then(|| get_comparator(&pq.updated_at).1))
+                .fetch_all(&mut *conn)
+                .await?;
 
-        let has_more = packages.len() > pq.limit as usize;
-        packages.truncate(pq.limit as usize);
-        if back {
-            packages.reverse();
-        }
+            let has_more = packages.len() > pq.limit as usize;
+            packages.truncate(pq.limit as usize);
+            if back {
+                packages.reverse();
+            }
 
-        Ok((packages, has_more))
+            Ok((packages, has_more))
+        })
+        .await
     }
 
     /// Use the saved count for a single filter; otherwise count up to [`MAX_COUNT`].
     /// The bool is true when there are more matches than the limit.
     pub async fn count_packages(&self, pq: &PackageQuery) -> Result<(i64, bool), Error> {
-        let Some(plan) = self.plan(pq).await? else {
-            return Ok((0, false));
-        };
+        self.query(async |conn| {
+            let Some(plan) = self.plan(pq, &mut *conn).await? else {
+                return Ok((0, false));
+            };
 
-        if plan.residual == "[]"
-            && pq.platform.trim().is_empty()
-            && !plan.kind.is_empty()
-            && pq.version.is_empty()
-            && pq.updated_at.is_empty()
-        {
-            let exact: Option<i64> = sqlx::query_scalar(
-                "SELECT package_count FROM facet_counts
-                 WHERE repo_id = $1 AND kind = $2 AND value = $3",
-            )
-            .bind(pq.repo_id)
-            .bind(&plan.kind)
-            .bind(&plan.value)
-            .fetch_optional(&self.db)
-            .await?;
+            if plan.residual == "[]"
+                && pq.platform.trim().is_empty()
+                && !plan.kind.is_empty()
+                && pq.version.is_empty()
+                && pq.updated_at.is_empty()
+            {
+                let exact: Option<i64> = sqlx::query_scalar(
+                    "SELECT package_count FROM facet_counts
+                     WHERE repo_id = $1 AND kind = $2 AND value = $3",
+                )
+                .bind(pq.repo_id)
+                .bind(&plan.kind)
+                .bind(&plan.value)
+                .fetch_optional(&mut *conn)
+                .await?;
 
-            if let Some(n) = exact {
-                return Ok((n, false));
+                if let Some(n) = exact {
+                    return Ok((n, false));
+                }
             }
-        }
 
-        let sql = comparisons(&plan.lst.count, pq, 7);
-        let n: i64 = sqlx::query_scalar(&sql)
-            .bind(pq.repo_id)
-            .bind(&plan.kind)
-            .bind(&plan.value)
-            .bind(&plan.residual)
-            .bind(pq.platform.trim())
-            .bind(MAX_COUNT + 1)
-            .bind(normalize_version(get_comparator(&pq.version).1))
-            .bind((!pq.updated_at.is_empty()).then(|| get_comparator(&pq.updated_at).1))
-            .fetch_one(&self.db)
-            .await?;
+            let sql = comparisons(&plan.lst.count, pq, 7);
+            let n: i64 = sqlx::query_scalar(&sql)
+                .bind(pq.repo_id)
+                .bind(&plan.kind)
+                .bind(&plan.value)
+                .bind(&plan.residual)
+                .bind(pq.platform.trim())
+                .bind(MAX_COUNT + 1)
+                .bind(normalize_version(get_comparator(&pq.version).1))
+                .bind((!pq.updated_at.is_empty()).then(|| get_comparator(&pq.updated_at).1))
+                .fetch_one(&mut *conn)
+                .await?;
 
-        Ok((n.min(MAX_COUNT), n > MAX_COUNT))
+            Ok((n.min(MAX_COUNT), n > MAX_COUNT))
+        })
+        .await
     }
 
     /// Start with the filter matching the fewest packages, then check the others.
     /// Return `None` if any filter has no matches in this repository.
-    async fn plan(&self, pq: &PackageQuery) -> Result<Option<Plan>, Error> {
+    async fn plan(
+        &self,
+        pq: &PackageQuery,
+        conn: &mut SqliteConnection,
+    ) -> Result<Option<Plan>, Error> {
         let wanted = pq.facets();
         if wanted.is_empty() {
             return Ok(Some(Plan::default()));
@@ -163,7 +230,7 @@ impl Manager {
         let drive: Option<(String, String, i64)> = sqlx::query_as(&Q.pick_facet.query)
             .bind(pq.repo_id)
             .bind(to_facet_json(&wanted))
-            .fetch_optional(&self.db)
+            .fetch_optional(conn)
             .await?;
 
         let Some((kind, value, matched)) = drive else {
@@ -188,47 +255,56 @@ impl Manager {
 
     /// Get unique license values.
     pub async fn get_licenses(&self) -> Result<Vec<String>, Error> {
-        Ok(sqlx::query_scalar(&Q.get_licenses.query)
-            .fetch_all(&self.db)
-            .await?)
+        self.query(async |conn| {
+            Ok(sqlx::query_scalar(&Q.get_licenses.query)
+                .fetch_all(&mut *conn)
+                .await?)
+        })
+        .await
     }
 
     /// Get every platforms.
     pub async fn get_platforms(&self) -> Result<Vec<String>, Error> {
-        Ok(sqlx::query_scalar(&Q.get_platforms.query)
-            .fetch_all(&self.db)
-            .await?)
+        self.query(async |conn| {
+            Ok(sqlx::query_scalar(&Q.get_platforms.query)
+                .fetch_all(&mut *conn)
+                .await?)
+        })
+        .await
     }
 
     pub async fn search_packages(&self, pq: &PackageQuery) -> Result<(Vec<Package>, bool), Error> {
-        let (term, name_only) = pq.search();
-        let fts = to_fts_query(term, pq.repo_id, name_only);
-        if fts.is_empty() {
-            return Ok((vec![], false));
-        }
+        self.query(async |conn| {
+            let (term, name_only) = pq.search();
+            let fts = to_fts_query(term, pq.repo_id, name_only);
+            if fts.is_empty() {
+                return Ok((vec![], false));
+            }
 
-        let raw = term.to_lowercase();
-        let norm = norm_name(term);
-        let wanted = pq.facets();
+            let raw = term.to_lowercase();
+            let norm = norm_name(term);
+            let wanted = pq.facets();
 
-        let sql = comparisons(&SEARCH_PACKAGES, pq, 9);
-        let mut packages: Vec<Package> = sqlx::query_as(&sql)
-            .bind(pq.repo_id)
-            .bind(fts)
-            .bind(&raw)
-            .bind(&norm)
-            .bind(to_facet_json(&wanted))
-            .bind(pq.platform.trim())
-            .bind(pq.offset)
-            .bind(pq.limit + 1)
-            .bind(normalize_version(get_comparator(&pq.version).1))
-            .bind((!pq.updated_at.is_empty()).then(|| get_comparator(&pq.updated_at).1))
-            .fetch_all(&self.db)
-            .await?;
+            let sql = comparisons(&SEARCH_PACKAGES, pq, 9);
+            let mut packages: Vec<Package> = sqlx::query_as(&sql)
+                .bind(pq.repo_id)
+                .bind(fts)
+                .bind(&raw)
+                .bind(&norm)
+                .bind(to_facet_json(&wanted))
+                .bind(pq.platform.trim())
+                .bind(pq.offset)
+                .bind(pq.limit + 1)
+                .bind(normalize_version(get_comparator(&pq.version).1))
+                .bind((!pq.updated_at.is_empty()).then(|| get_comparator(&pq.updated_at).1))
+                .fetch_all(&mut *conn)
+                .await?;
 
-        let has_more = packages.len() > pq.limit as usize;
-        packages.truncate(pq.limit as usize);
-        Ok((packages, has_more))
+            let has_more = packages.len() > pq.limit as usize;
+            packages.truncate(pq.limit as usize);
+            Ok((packages, has_more))
+        })
+        .await
     }
 }
 

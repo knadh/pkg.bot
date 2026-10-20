@@ -1,6 +1,7 @@
 use std::{
     io::{BufRead, Write},
     path::Path,
+    time::Duration,
 };
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -51,8 +52,7 @@ pub async fn init(
     read_only: bool,
 ) -> Result<SqlitePool, sqlx::Error> {
     let mode = if read_only { "ro" } else { "rwc" };
-    let db = SqlitePoolOptions::new()
-        .max_connections(max_conns)
+    let db = pool_options(max_conns)
         .after_connect(|conn, _| {
             Box::pin(async move {
                 conn.execute(SCHEMA.pragma.query.as_str()).await?;
@@ -63,4 +63,17 @@ pub async fn init(
         .await?;
 
     Ok(db)
+}
+
+pub fn pool_options(max_conns: u32) -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(max_conns)
+        .acquire_timeout(Duration::from_secs(1))
+        .after_release(|conn, _| {
+            Box::pin(async move {
+                // Wait for cancelled SQLite work to stop.
+                conn.lock_handle().await?.remove_progress_handler();
+                Ok(true)
+            })
+        })
 }

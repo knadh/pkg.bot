@@ -111,9 +111,16 @@ impl ApiErr {
     }
 }
 
-impl<E: std::fmt::Display> From<E> for ApiErr {
-    fn from(err: E) -> Self {
-        Self::new(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+impl From<crate::manager::Error> for ApiErr {
+    fn from(err: crate::manager::Error) -> Self {
+        use crate::manager::Error;
+        let status = match &err {
+            Error::Busy => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Error::NotFound => StatusCode::NOT_FOUND,
+            Error::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self::new(err.to_string(), status)
     }
 }
 

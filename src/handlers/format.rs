@@ -82,7 +82,10 @@ pub fn respond<T: Serialize + CsvColumns>(format: ApiFormat, data: T) -> Result<
         ApiFormat::Json => json(data).into_response(),
         ApiFormat::Csv => (
             [(header::CONTENT_TYPE, "text/csv; charset=utf-8")],
-            write_csv(serde_json::to_value(&data)?, T::COLUMNS)?,
+            write_csv(
+                serde_json::to_value(&data).map_err(format_error)?,
+                T::COLUMNS,
+            )?,
         )
             .into_response(),
     };
@@ -103,23 +106,32 @@ fn write_csv(data: Value, headers: &[&str]) -> Result<Vec<u8>> {
     let mut writer = csv::WriterBuilder::new()
         .delimiter(b'|')
         .from_writer(Vec::new());
-    writer.write_record(headers)?;
+    writer.write_record(headers).map_err(format_error)?;
     for row in &rows {
-        writer.write_record(headers.iter().map(|key| {
-            let value = if row.is_object() { &row[*key] } else { row };
-            let text = match value {
-                Value::Array(links) if *key == "links" => links
-                    .iter()
-                    .filter_map(|link| link["url"].as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                _ => cell(value),
-            };
+        writer
+            .write_record(headers.iter().map(|key| {
+                let value = if row.is_object() { &row[*key] } else { row };
+                let text = match value {
+                    Value::Array(links) if *key == "links" => links
+                        .iter()
+                        .filter_map(|link| link["url"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    _ => cell(value),
+                };
 
-            esc_terminal_chars(&text)
-        }))?;
+                esc_terminal_chars(&text)
+            }))
+            .map_err(format_error)?;
     }
-    Ok(writer.into_inner()?)
+    writer.into_inner().map_err(format_error)
+}
+
+fn format_error(err: impl std::fmt::Display) -> ApiErr {
+    ApiErr::new(
+        err.to_string(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    )
 }
 
 /// Flatten nested values to comma or space separated strings.

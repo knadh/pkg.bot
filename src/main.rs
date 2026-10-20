@@ -90,6 +90,10 @@ async fn main() {
     let config = config::load_all(&cli.config);
 
     // Create database pool.
+    if let Err(e) = config.db.validate() {
+        log::error!("invalid configuration: {e}");
+        std::process::exit(1);
+    }
     let db = match db::init(&db_path, config.db.max_conns, false).await {
         Ok(pool) => pool,
         Err(e) => {
@@ -98,8 +102,14 @@ async fn main() {
         }
     };
 
+    // Separate DB connection for health checks.
+    let health_db = db::init(&db_path, 1, true).await.unwrap_or_else(|e| {
+        log::error!("error connecting health check to database: {e}");
+        std::process::exit(1);
+    });
+
     // Initialize manager.
-    let mgr = Arc::new(Manager::new(db));
+    let mgr = Arc::new(Manager::new(db, health_db, &config.db));
 
     // Load the repos once. They only change when an indexer adds one.
     let repos = match mgr

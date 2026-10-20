@@ -694,14 +694,32 @@ pub struct AppConfig {
     pub root_url: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct DbConfig {
-    #[serde(default = "default_max_conns")]
     pub max_conns: u32,
+    pub query_timeout_ms: u64,
 }
 
-fn default_max_conns() -> u32 {
-    5
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self {
+            max_conns: 2,
+            query_timeout_ms: 3000,
+        }
+    }
+}
+
+impl DbConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_conns == 0 {
+            return Err("db.max_conns must be positive");
+        }
+        if !(1..=60000).contains(&self.query_timeout_ms) {
+            return Err("db.query_timeout_ms must be between 1 and 60000");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,11 +1,11 @@
 -- name: pragma
 -- Concurrency (minimal write concern)
 PRAGMA journal_mode       = WAL;
-PRAGMA busy_timeout       = 10000;
+PRAGMA busy_timeout       = 1000;
 PRAGMA wal_autocheckpoint = 0;          -- Disable auto-checkpoint; do it manually during maintenance
-PRAGMA cache_size         = -256000;    -- 256MB cache (or more if available)
-PRAGMA temp_store         = MEMORY;
-PRAGMA mmap_size          = 1073741824; -- 1GB mmap - keep entire DB in memory if possible
+PRAGMA cache_size         = -8192;      -- 8 MiB per connection
+PRAGMA temp_store         = FILE;       -- Allow large sorts to spill to disk
+PRAGMA mmap_size          = 67108864;   -- Map at most 64 MiB
 PRAGMA foreign_keys       = ON;
 PRAGMA query_only         = OFF;
 PRAGMA analysis_limit     = 1000;

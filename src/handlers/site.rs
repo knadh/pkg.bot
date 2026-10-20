@@ -306,6 +306,9 @@ fn render_data_error(ctx: &Ctx, err: ApiErr) -> Response {
     match err.status {
         StatusCode::NOT_FOUND => not_found(ctx, &err.message),
         StatusCode::BAD_REQUEST => render_message(ctx, err.status, "Invalid search", &err.message),
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
+            render_message(ctx, err.status, "Search unavailable", &err.message)
+        }
         _ => {
             log::error!("error fetching packages: {}", err.message);
             render_message(ctx, err.status, "Error", "Error fetching packages.")

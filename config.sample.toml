@@ -11,7 +11,9 @@ root_url = "http://localhost:9000"
 
 [db]
 # Maximum connections.
-max_conns = 100
+max_conns = 10
+
+query_timeout_ms = 3000
 
 
 [api_results]
