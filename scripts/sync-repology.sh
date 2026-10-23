@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run from the app directory: ./scripts/sync-repology.sh /path/to/data [FORCE_IMPORT]
 # Set FORCE_IMPORT to 1 to import even when the dump hasn't changed and download is skipped.
+# Cron requires a sudoers rule (configured with visudo):
+# pkgbot ALL=(root) NOPASSWD: /usr/bin/systemctl stop pkgbot.service, /usr/bin/systemctl start pkgbot.service
 set -euo pipefail
 
 log() {
@@ -39,7 +41,7 @@ cleanup() {
             mv -f "$dir/data.db.bak" "$dir/data.db" || true
         fi
         log "restarting pkgbot during cleanup"
-        systemctl start pkgbot || true
+        sudo -n /usr/bin/systemctl start pkgbot.service || true
     fi
     rm -f "$dump.part" "$dir/data.db.new"
     exit "$status"
@@ -110,7 +112,7 @@ chown --reference="$dir/data.db" "$dir/data.db.new"
 # Create a backup, stop the app, and replace the old DB with the new one.
 log "stopping pkgbot"
 stopped=true
-systemctl stop pkgbot
+sudo -n /usr/bin/systemctl stop pkgbot.service
 log "backing up the current database and replacing it with the new database"
 mv -f "$dir/data.db" "$dir/data.db.bak"
 backed_up=true
@@ -118,7 +120,7 @@ mv -f "$dir/data.db.new" "$dir/data.db"
 
 # Start!
 log "starting pkgbot"
-systemctl start pkgbot
+sudo -n /usr/bin/systemctl start pkgbot.service
 stopped=false
 rm -f "$pending"
 log "repology sync complete"
